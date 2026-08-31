@@ -32,6 +32,7 @@ export class MediasoupSession {
   private consumerMeta = new Map<string, { producerId: string; tileKey: string }>();
   private remoteTiles = new Map<string, RemoteTile>();
   private consuming = new Set<string>();
+  private pendingProducers = new Map<string, ProducerDescriptor>();
   private started = false;
   private disposed = false;
   private localStream?: MediaStream;
@@ -62,6 +63,7 @@ export class MediasoupSession {
       this.device = device;
 
       await this.createRecvTransport();
+      await this.flushPendingProducers();
       await this.createSendTransport();
 
       for (const producer of joined.existingProducers ?? []) {
@@ -71,6 +73,13 @@ export class MediasoupSession {
       }
 
       await this.publishLocalMedia(localStream);
+
+      // rtc:join 시점과 recv transport 준비 사이에 다른 참가자가 Producer를
+      // 만들면 rtc:new-producer 이벤트가 먼저 도착할 수 있습니다. 이벤트 큐와
+      // 서버의 현재 Producer 목록을 한 번 더 합쳐서 이 race condition을 제거합니다.
+      await this.syncRemoteProducers();
+      await this.flushPendingProducers();
+
       this.onStatus('연결됨');
     } catch (error) {
       this.started = false;
@@ -91,6 +100,8 @@ export class MediasoupSession {
     for (const producer of joined.existingProducers ?? []) {
       await this.consumeProducer(producer).catch(() => undefined);
     }
+    await this.syncRemoteProducers().catch(() => undefined);
+    await this.flushPendingProducers().catch(() => undefined);
     return joined.resumed;
   }
 
@@ -212,6 +223,7 @@ export class MediasoupSession {
     try { this.recvTransport?.close(); } catch {}
     this.consumers.clear();
     this.consumerMeta.clear();
+    this.pendingProducers.clear();
     this.remoteTiles.clear();
     this.emitRemote();
   }
@@ -311,7 +323,11 @@ export class MediasoupSession {
 
   private async consumeProducer(descriptor: ProducerDescriptor) {
     if (this.disposed || this.consumers.has(descriptor.producerId) || this.consuming.has(descriptor.producerId)) return;
-    if (!this.recvTransport || !this.device) return;
+    if (!this.recvTransport || !this.device) {
+      this.pendingProducers.set(descriptor.producerId, descriptor);
+      return;
+    }
+    this.pendingProducers.delete(descriptor.producerId);
     this.consuming.add(descriptor.producerId);
     try {
       const result = await emitAck<{ consumer: ConsumerDescriptor }>(this.socket, 'rtc:consume', {
@@ -355,7 +371,30 @@ export class MediasoupSession {
     }
   }
 
+  private async syncRemoteProducers() {
+    if (this.disposed || !this.recvTransport || !this.device) return;
+    const result = await emitAck<{ producers: ProducerDescriptor[] }>(this.socket, 'rtc:list-producers', {
+      sessionId: this.sessionId,
+    });
+    for (const producer of result.producers ?? []) {
+      await this.consumeProducer(producer).catch((error) => {
+        console.warn('Producer 동기화 소비 실패', producer.producerId, error);
+      });
+    }
+  }
+
+  private async flushPendingProducers() {
+    if (this.disposed || !this.recvTransport || !this.device || this.pendingProducers.size === 0) return;
+    const pending = [...this.pendingProducers.values()];
+    for (const producer of pending) {
+      await this.consumeProducer(producer).catch((error) => {
+        console.warn('대기 Producer 소비 실패', producer.producerId, error);
+      });
+    }
+  }
+
   private removeConsumer(producerId: string) {
+    this.pendingProducers.delete(producerId);
     const consumer = this.consumers.get(producerId);
     const meta = this.consumerMeta.get(producerId);
     if (consumer) {
@@ -375,6 +414,10 @@ export class MediasoupSession {
 
   private onNewProducer = (payload: ProducerDescriptor & { sessionId: string }) => {
     if (payload.sessionId !== this.sessionId) return;
+    if (!this.recvTransport || !this.device) {
+      this.pendingProducers.set(payload.producerId, payload);
+      return;
+    }
     void this.consumeProducer(payload).catch((error) => console.error('새 Producer 소비 실패', error));
   };
 
