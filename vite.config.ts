@@ -7,4 +7,8 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
   },
+  preview: {
+    host: '0.0.0.0',
+    allowedHosts: ['telemedicine-front-production.up.railway.app'],
+  },
 });
